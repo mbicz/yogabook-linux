@@ -26,3 +26,6 @@
 [submodule "iio-sensor-proxy"]
 	path = iio-sensor-proxy
 	url = https://gitlab.freedesktop.org/jekhor/iio-sensor-proxy.git
+[submodule "yogabook-hardware-check"]
+	path = yogabook-hardware-check
+	url = https://github.com/mbicz/yogabook-hardware-check.git

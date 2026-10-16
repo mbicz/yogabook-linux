@@ -16,6 +16,32 @@ Most of the hardware is functional, with the following exceptions:
 
 Most Linux patches have been mainlined, except for the sound drivers.
 
+## Kernel-upgrade hardware verification
+
+The `yogabook-hardware-check` submodule provides a small generic pytest framework
+and a separate YB1-X90F suite. Checks are ordinary Python assertions or runnable
+shell files; board-specific options stay with the suite, not in the framework.
+
+From this umbrella repository on the Yoga Book:
+
+```sh
+git submodule update --init yogabook-hardware-check
+cd yogabook-hardware-check
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/yb-check list checks/yogabook
+sudo .venv/bin/yb-check run checks/yogabook --report reports/kernel.json -v
+```
+
+Enumeration, headless operation, userspace integration and physical observations
+are independent results. Pending human checks never erase a successful low-level
+assertion, and enumeration alone never establishes operation. Camera/audio/GPS
+exercise is opt-in; missing prerequisites are blocked, not passed. See the
+[suite guide](yogabook-hardware-check/checks/yogabook/README.md) for active runs,
+the Python/shell warning/error contract, evidence limits and boot-bound human
+acceptance. Keep reports and proprietary runtime data out of git.
+
+
 ## What You Need to Know
 
 The Yoga Book tablet features a sensor keyboard, which essentially functions as
