@@ -3,6 +3,17 @@
 This repository serves as a central hub for software related to running GNU/Linux
 on Lenovo Yoga Book tablets (YB1-X91L/F, YB1-X90L/F).
 
+## X90F fork status
+
+The tested Android-edition X90F/Debian stack, kernel release and known limits are
+in [X90F maintenance](doc/x90f-maintenance.md). The cameras work through the
+separate [yogabook-camera](https://github.com/mbicz/yogabook-camera/tree/v0.1)
+project and its documented kernel prerequisites.
+See also the [comparison with Yoga-Book](doc/x90f-yoga-book-comparison.md).
+
+The installation instructions and status below are inherited upstream notes,
+not the current acceptance report for this fork.
+
 ## Status
 
 Instructions are for YB1-X91 (Windows) models. Android (YB1-X90) version should works
