@@ -1,10 +1,15 @@
 # Yoga Book Linux: YB1-X90F fork
 
 This is mbicz's fork of [jekhor/yogabook-linux](https://github.com/jekhor/yogabook-linux).
-**Read the `yb-release` branch.** The fork's `master` is an unchanged mirror of
-jekhor's umbrella and is not maintained.
 
-`yb-release` documents and pins a tested setup for the **Android-edition
+| Branch | Purpose |
+|---|---|
+| `develop` (default) | Our line: the tested YB1-X90F setup described below. It always descends from `master`. |
+| `master` | Unchanged mirror of jekhor's umbrella, kept as the base for upstreaming. Update it with `gh repo sync mbicz/yogabook-linux --branch master`; do not commit to it. |
+
+`develop` was called `yb-release` until 2026-11-15; GitHub redirects the old name.
+
+`develop` documents and pins a tested setup for the **Android-edition
 Lenovo Yoga Book YB1-X90F** (YETI-11 firmware) running **Debian 13 (trixie)** on a
 custom **6.18.58 LTS** kernel. It is not a claim of YB1-X91L compatibility.
 
@@ -78,7 +83,7 @@ observed on the device; the evidence column says what was and was not checked.
 ## Using this branch
 
 ```sh
-git clone -b yb-release https://github.com/mbicz/yogabook-linux.git
+git clone https://github.com/mbicz/yogabook-linux.git
 cd yogabook-linux
 git submodule update --init touch-keyboard yogabook-support yogabook-hardware-check alsa-ucm-conf-yogabook
 ```
