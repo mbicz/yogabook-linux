@@ -4,13 +4,13 @@
 
 [submodule "yogabook-linux-kernel"]
 	path = yogabook-linux-kernel
-	url = https://github.com/jekhor/yogabook-linux-kernel.git
+	url = https://github.com/mbicz/yogabook-linux-kernel.git
 [submodule "android_kernel_lenovo_yeti"]
 	path = android_kernel_lenovo_yeti
 	url = https://github.com/jekhor/yogabook-linux-android-kernel.git
 [submodule "chromiumos_touch_keyboard"]
 	path = touch-keyboard
-	url = https://github.com/jekhor/chromiumos_touch_keyboard.git
+	url = https://github.com/mbicz/chromiumos_touch_keyboard.git
 [submodule "live-cd"]
 	path = live-cd
 	url = https://github.com/jekhor/yogabook-livecd.git
@@ -22,7 +22,7 @@
 	url = https://github.com/jekhor/alsa-ucm-conf-yogabook
 [submodule "yogabook-support"]
 	path = yogabook-support
-	url = https://github.com/jekhor/yogabook-support.git
+	url = https://github.com/mbicz/yogabook-support.git
 [submodule "iio-sensor-proxy"]
 	path = iio-sensor-proxy
 	url = https://gitlab.freedesktop.org/jekhor/iio-sensor-proxy.git
