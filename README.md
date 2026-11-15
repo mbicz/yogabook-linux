@@ -46,7 +46,7 @@ A newer version number alone is not a reason.
 | OS | Debian 13 (trixie), GNOME 48 on Wayland | |
 | Halo keyboard | `touch-keyboard` 1.5.0+yb6 | submodule `touch-keyboard` |
 | Posture, modes handler | `yogabook-support` 1.6.1+yb1 | submodule `yogabook-support` |
-| Cameras | `yogabook-camera`; the source is identical to the deployed build | [mbicz/yogabook-camera](https://github.com/mbicz/yogabook-camera) v0.1 |
+| Cameras | `yogabook-camera` 1.1.7; the daemon, service, wrapper and config files are byte-identical to the public v0.1 | [mbicz/yogabook-camera](https://github.com/mbicz/yogabook-camera) v0.1 |
 | GNSS | `yogabook-gnss` 1.0.4+yb1 | [Yoga-Book-GNSS](https://github.com/Yoga-Book/Yoga-Book-GNSS) plus [`devices/YB1-X90/gnss`](devices/YB1-X90/gnss); you supply the runtime |
 | Ambient brightness | `gnome-settings-daemon` 48.1-1.1+0yb1 | patch in [`devices/YB1-X90/gsd-ambient`](devices/YB1-X90/gsd-ambient) |
 | Sleep | lid-watch service and drop-ins | [`devices/YB1-X90/sleep`](devices/YB1-X90/sleep) |
