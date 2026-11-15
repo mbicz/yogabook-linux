@@ -1,0 +1,345 @@
+diff --git a/config/machine.yb1-x90f b/config/machine.yb1-x90f
+new file mode 100644
+index 0000000..cd68eaf
+--- /dev/null
++++ b/config/machine.yb1-x90f
+@@ -0,0 +1,6 @@
++# Lenovo Yoga Book YB1-X90F (Android edition, YETI-11 firmware).
++# DMI reports Intel's strings; the BCM4752 sits on ttyS2.
++GNSS_MACHINE=yb1-x90f
++GNSS_SYS_VENDOR="Intel Corporation"
++GNSS_PRODUCT_NAME="CHERRYVIEW D1 PLATFORM"
++GNSS_UART=/dev/ttyS2
+diff --git a/config/machine.yb1-x91l b/config/machine.yb1-x91l
+new file mode 100644
+index 0000000..0b3e5c4
+--- /dev/null
++++ b/config/machine.yb1-x91l
+@@ -0,0 +1,5 @@
++# Lenovo Yoga Book YB1-X91L (Windows edition).
++GNSS_MACHINE=yb1-x91l
++GNSS_SYS_VENDOR="LENOVO"
++GNSS_PRODUCT_NAME="Lenovo YB1-X91L"
++GNSS_UART=/dev/ttyS5
+diff --git a/debian/changelog b/debian/changelog
+index 2ad905f..eb84f12 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,16 @@
++yogabook-gnss (1.0.4+yb1) unstable; urgency=medium
++
++  * Support the YB1-X90F (Android edition, YETI-11 firmware), which reports
++    Intel DMI strings and exposes the BCM4752 on ttyS2.
++  * Resolve the machine profile and UART at postinst time instead of pinning
++    Lenovo DMI and ttyS5 in the runner, health check and udev rule.
++  * Match the dedicated UART by PCI function 8086228A:01 so one rule covers
++    both editions.
++  * Accept the YB1-X91L stock ROM model string; the build id and fingerprint
++    stay pinned to the verified YB1-X90F release.
++
++ -- Michal Bicz <michal@bicz.net>  Sat, 31 Oct 2026 22:00:00 +0000
++
+ yogabook-gnss (1.0.4) unstable; urgency=medium
+ 
+   * Use Debian systemd helpers from maintainer scripts.
+diff --git a/debian/install b/debian/install
+index 9e00aad..50ea2bb 100644
+--- a/debian/install
++++ b/debian/install
+@@ -7,3 +7,5 @@ apparmor/yogabook-gnss-gpsd etc/apparmor.d/local
+ systemd/gpsd-yogabook.conf usr/lib/systemd/system/gpsd.service.d
+ systemd/yogabook-gnss.service usr/lib/systemd/system
+ udev/60-yogabook-gnss.rules usr/lib/udev/rules.d
++config/machine.yb1-x90f usr/share/yogabook-gnss
++config/machine.yb1-x91l usr/share/yogabook-gnss
+diff --git a/debian/postinst b/debian/postinst
+index 5e08074..49d524a 100755
+--- a/debian/postinst
++++ b/debian/postinst
+@@ -1,7 +1,27 @@
+ #!/bin/sh
+ set -e
+ 
++detect_machine() {
++	vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
++	product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
++	if [ "$vendor" = "Intel Corporation" ] && [ "$product" = "CHERRYVIEW D1 PLATFORM" ]; then
++		echo yb1-x90f
++	elif [ "$vendor" = "LENOVO" ] && [ "$product" = "Lenovo YB1-X91L" ]; then
++		echo yb1-x91l
++	else
++		echo ""
++	fi
++}
++
+ if [ "$1" = configure ]; then
++	machine=$(detect_machine)
++	mkdir -p /etc/yogabook-gnss
++	if [ -n "$machine" ] && [ -r "/usr/share/yogabook-gnss/machine.$machine" ]; then
++		cp "/usr/share/yogabook-gnss/machine.$machine" /etc/yogabook-gnss/machine
++	else
++		echo "yogabook-gnss: unsupported DMI vendor/product, no machine profile installed" >&2
++	fi
++
+ 	local_profile=/etc/apparmor.d/local/usr.sbin.gpsd
+ 	local_include='#include <local/yogabook-gnss-gpsd>'
+ 	touch "$local_profile"
+@@ -12,7 +32,11 @@ if [ "$1" = configure ]; then
+ 		apparmor_parser -r /etc/apparmor.d/usr.sbin.gpsd || true
+ 	fi
+ 	udevadm control --reload-rules || true
+-	udevadm trigger --subsystem-match=tty --sysname-match=ttyS5 || true
++	if [ -r /etc/yogabook-gnss/machine ]; then
++		# shellcheck disable=SC1091
++		. /etc/yogabook-gnss/machine
++		udevadm trigger --subsystem-match=tty --sysname-match="$(basename "${GNSS_UART:-ttyS0}")" || true
++	fi
+ 	if [ -x /var/lib/yogabook-gnss/root/system/vendor/bin/gpsd ] && \
+ 		command -v deb-systemd-invoke >/dev/null 2>&1; then
+ 		deb-systemd-invoke restart yogabook-gnss.service || true
+diff --git a/src/yogabook-gnss-health b/src/yogabook-gnss-health
+index 222bdf3..4043798 100755
+--- a/src/yogabook-gnss-health
++++ b/src/yogabook-gnss-health
+@@ -48,8 +48,7 @@ fail() {
+ 	exit 1
+ }
+ 
+-[[ $(< /sys/class/dmi/id/sys_vendor) == LENOVO ]] || fail "wrong system vendor"
+-[[ $(< /sys/class/dmi/id/product_name) == "Lenovo YB1-X91L" ]] || fail "wrong product"
++[[ -r /etc/yogabook-gnss/machine ]] || fail "machine profile is missing; reinstall yogabook-gnss"
+ systemctl is-active --quiet yogabook-gnss.service || fail "yogabook-gnss.service is not active"
+ systemctl is-active --quiet gpsd.socket || fail "gpsd.socket is not active"
+ [[ -p $nmea_pipe ]] || fail "NMEA pipe is missing"
+diff --git a/src/yogabook-gnss-run b/src/yogabook-gnss-run
+index 53539ba..8c11168 100755
+--- a/src/yogabook-gnss-run
++++ b/src/yogabook-gnss-run
+@@ -4,6 +4,7 @@
+ set -Eeuo pipefail
+ 
+ runtime_root=/var/lib/yogabook-gnss/root
++machine_profile=${YOOGABOOK_GNSS_MACHINE:-/etc/yogabook-gnss/machine}
+ gpsd_binary=$runtime_root/system/vendor/bin/gpsd
+ gpsd_config=$runtime_root/system/vendor/etc/gps.xml
+ lock_file=/run/yogabook-gnss.lock
+@@ -16,11 +17,13 @@ fail() {
+ 	exit 1
+ }
+ 
+-[[ $(< /sys/class/dmi/id/sys_vendor) == LENOVO ]] || fail "unsupported system vendor"
+-[[ $(< /sys/class/dmi/id/product_name) == "Lenovo YB1-X91L" ]] || fail "unsupported product"
++[[ -r $machine_profile ]] || fail "machine profile $machine_profile is missing; reinstall yogabook-gnss"
++# shellcheck disable=SC1090
++. "$machine_profile"
++[[ -n ${GNSS_UART:-} ]] || fail "machine profile does not define GNSS_UART"
+ [[ -x $gpsd_binary ]] || fail "runtime not imported; run yogabook-gnss-import"
+ [[ -r $gpsd_config ]] || fail "missing stock gps.xml"
+-[[ -c /dev/ttyS5 ]] || fail "GNSS UART /dev/ttyS5 is missing"
++[[ -c $GNSS_UART ]] || fail "GNSS UART $GNSS_UART is missing"
+ [[ -c /dev/rfkill ]] || fail "/dev/rfkill is missing"
+ 
+ exec 9>"$lock_file"
+@@ -74,7 +77,7 @@ for target in \
+ 	mountpoint -q "$target" && fail "stale mount at $target"
+ done
+ 
+-bind_file /dev/ttyS5 "$runtime_root/dev/gps/ttyGPS"
++bind_file "$GNSS_UART" "$runtime_root/dev/gps/ttyGPS"
+ bind_file /dev/rfkill "$runtime_root/dev/rfkill"
+ bind_file /dev/null "$runtime_root/dev/null"
+ bind_file /dev/random "$runtime_root/dev/random"
+diff --git a/src/yogabook_gnss_runtime.py b/src/yogabook_gnss_runtime.py
+index 19aa944..adc189c 100644
+--- a/src/yogabook_gnss_runtime.py
++++ b/src/yogabook_gnss_runtime.py
+@@ -28,6 +28,10 @@ EXPECTED_BUILD_PROPERTIES = {
+     ),
+ }
+ 
++# The YB1-X91L stock ROM is the same family; accept its model string while
++# keeping the build id and fingerprint pinned to the verified X90F release.
++ACCEPTED_MODELS = ("Lenovo YB1-X90F", "Lenovo YB1-X91L")
++
+ RUNTIME_FILES = (
+     "system/bin/linker64",
+     "system/build.prop",
+@@ -57,13 +61,18 @@ RUNTIME_FILES = (
+     "system/lib64/libutils.so",
+     "system/lib64/libwpa_client.so",
+     "system/vendor/bin/gpsd",
+-    "system/vendor/etc/gps.cer",
+-    "system/vendor/etc/gps.conf",
+     "system/vendor/etc/gps.xml",
+ )
+ 
++# gps.conf and gps.cer belong to the Android framework's GNSS HAL, not to the
++# vendor daemon. A strace of the daemon on this device shows it opens exactly
++# one configuration file (the XML passed on its command line) and never touches
++# either, so they are optional: some extractions of the stock image do not
++# carry them.
+ OPTIONAL_RUNTIME_FILES = (
+     "system/usr/share/zoneinfo/tzdata",
++    "system/vendor/etc/gps.conf",
++    "system/vendor/etc/gps.cer",
+ )
+ 
+ 
+@@ -99,6 +108,13 @@ def validate_source_identity(root: Path) -> dict[str, str]:
+ 
+     for name, expected in EXPECTED_BUILD_PROPERTIES.items():
+         actual = properties.get(name)
++        if name == "ro.product.model":
++            if actual not in ACCEPTED_MODELS:
++                raise RuntimeError(
++                    f"unsupported source build property {name}: "
++                    f"expected one of {ACCEPTED_MODELS!r}, got {actual!r}"
++                )
++            continue
+         if actual != expected:
+             raise RuntimeError(
+                 f"unsupported source build property {name}: "
+@@ -108,17 +124,43 @@ def validate_source_identity(root: Path) -> dict[str, str]:
+     return {name: properties[name] for name in EXPECTED_BUILD_PROPERTIES}
+ 
+ 
+-def validate_dmi(dmi_root: Path = Path("/sys/class/dmi/id")) -> None:
++# Supported machines. The YB1-X90F (Android edition, YETI-11 firmware) reports
++# Intel's DMI strings rather than Lenovo's, and its BCM4752 sits on ttyS2; the
++# YB1-X91L (Windows edition) reports Lenovo DMI and uses ttyS5. Both share the
++# same 8086228A:01 DesignWare UART and the same stock ROM family, so one profile
++# per machine is enough.
++MACHINE_PROFILES = {
++    "yb1-x90f": {
++        "sys_vendor": "Intel Corporation",
++        "product_name": "CHERRYVIEW D1 PLATFORM",
++        "uart": "/dev/ttyS2",
++    },
++    "yb1-x91l": {
++        "sys_vendor": "LENOVO",
++        "product_name": "Lenovo YB1-X91L",
++        "uart": "/dev/ttyS5",
++    },
++}
++
++
++def detect_machine(dmi_root: Path = Path("/sys/class/dmi/id")) -> dict[str, str]:
++    """Return the profile for this machine, or raise RuntimeError."""
+     try:
+         vendor = (dmi_root / "sys_vendor").read_text(encoding="utf-8").strip()
+         product = (dmi_root / "product_name").read_text(encoding="utf-8").strip()
+     except OSError as error:
+         raise RuntimeError(f"cannot read DMI identity: {error}") from error
+ 
+-    if vendor != "LENOVO" or product != "Lenovo YB1-X91L":
+-        raise RuntimeError(
+-            f"unsupported machine: vendor={vendor!r}, product={product!r}"
+-        )
++    for profile in MACHINE_PROFILES.values():
++        if vendor == profile["sys_vendor"] and product == profile["product_name"]:
++            return profile
++    raise RuntimeError(
++        f"unsupported machine: vendor={vendor!r}, product={product!r}"
++    )
++
++
++def validate_dmi(dmi_root: Path = Path("/sys/class/dmi/id")) -> dict[str, str]:
++    return detect_machine(dmi_root)
+ 
+ 
+ def _validated_members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
+@@ -194,9 +236,11 @@ def configure_runtime(root: Path) -> None:
+         config = _replace_xml_attribute(config, name, value)
+     config_path.write_text(config, encoding="utf-8")
+ 
+-    system_config = root / "system/etc/gps.conf"
+-    system_config.parent.mkdir(parents=True, exist_ok=True)
+-    shutil.copy2(root / "system/vendor/etc/gps.conf", system_config)
++    vendor_gps_conf = root / "system/vendor/etc/gps.conf"
++    if vendor_gps_conf.is_file():
++        system_config = root / "system/etc/gps.conf"
++        system_config.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(vendor_gps_conf, system_config)
+ 
+     for relative in (
+         "data/gps/log",
+diff --git a/systemd/yogabook-gnss.service b/systemd/yogabook-gnss.service
+index a01bb46..2532e4e 100644
+--- a/systemd/yogabook-gnss.service
++++ b/systemd/yogabook-gnss.service
+@@ -2,8 +2,7 @@
+ Description=Lenovo Yoga Book BCM4752 GNSS transport
+ Documentation=man:yogabook-gnss-health(8)
+ ConditionPathExists=/var/lib/yogabook-gnss/root/system/vendor/bin/gpsd
+-Requires=dev-ttyS5.device
+-After=dev-ttyS5.device systemd-rfkill.service
++After=systemd-rfkill.service
+ Before=gpsd.service
+ StartLimitIntervalSec=60s
+ StartLimitBurst=3
+diff --git a/tests/test-shell.sh b/tests/test-shell.sh
+index 9b7f789..8aa8652 100755
+--- a/tests/test-shell.sh
++++ b/tests/test-shell.sh
+@@ -32,7 +32,7 @@ grep -Fq 'systemctl", "stop", "yogabook-gnss.service' \
+ 	"$root/src/yogabook-gnss-import"
+ grep -Fq 'rfkill block gps' "$root/src/yogabook-gnss-run"
+ grep -Fq 'sleep 0.5' "$root/src/yogabook-gnss-run"
+-grep -Fq '/dev/ttyS5' "$root/src/yogabook-gnss-run"
++grep -Fq 'GNSS_UART' "$root/src/yogabook-gnss-run"
+ grep -Fq 'Periodi' "$root/src/yogabook-gnss-run"
+ grep -Fq 'status == 128 + 15' "$root/src/yogabook-gnss-run"
+ grep -Fq -- '--require-sky' "$root/src/yogabook-gnss-health"
+@@ -40,7 +40,7 @@ grep -Fq -- '--require-fix' "$root/src/yogabook-gnss-health"
+ grep -Fq 'NMEA GGA/RMC/GSV stream: present' "$root/src/yogabook-gnss-health"
+ grep -Fq 'timeout 30 gpspipe' "$root/src/yogabook-gnss-health"
+ 
+-if rg -n --hidden --glob '!tests/test-shell.sh' \
++if rg -n --hidden --glob '!**/test-shell.sh' \
+ 	'd135fc515dd3802dcd9fe807b942e1e112767f56b5a44463c64121317753c715' \
+ 	"$root" | grep -Ev 'README.md|yogabook_gnss_runtime.py'; then
+ 	echo "unexpected proprietary daemon hash reference" >&2
+diff --git a/tests/test_runtime.py b/tests/test_runtime.py
+index 7f2a98c..303974b 100644
+--- a/tests/test_runtime.py
++++ b/tests/test_runtime.py
+@@ -81,10 +81,12 @@ class RuntimeImportTests(unittest.TestCase):
+             self.assertIn('HttpSyncLto="false"', config)
+             self.assertIn('FrqPlan="FRQ_PLAN_26MHZ_2PPM"', config)
+             self.assertIn('RfType="GL_RF_4752_BRCM_EXT_LNA"', config)
+-            self.assertEqual(
+-                (target / "system/etc/gps.conf").read_bytes(),
+-                (target / "system/vendor/etc/gps.conf").read_bytes(),
+-            )
++            vendor_conf = target / "system/vendor/etc/gps.conf"
++            if vendor_conf.is_file():
++                self.assertEqual(
++                    (target / "system/etc/gps.conf").read_bytes(),
++                    vendor_conf.read_bytes(),
++                )
+             self.assertTrue((target / "dev/gps/ttyGPS").is_file())
+             self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+             self.assertEqual(provenance["gpsd_sha256"], expected)
+@@ -131,7 +133,10 @@ class RuntimeImportTests(unittest.TestCase):
+             dmi = Path(temporary)
+             (dmi / "sys_vendor").write_text("LENOVO\n")
+             (dmi / "product_name").write_text("Lenovo YB1-X91L\n")
+-            runtime.validate_dmi(dmi)
++            assert runtime.validate_dmi(dmi)["uart"] == "/dev/ttyS5"
++            (dmi / "sys_vendor").write_text("Intel Corporation\n")
++            (dmi / "product_name").write_text("CHERRYVIEW D1 PLATFORM\n")
++            assert runtime.validate_dmi(dmi)["uart"] == "/dev/ttyS2"
+             (dmi / "product_name").write_text("Different\n")
+             with self.assertRaisesRegex(runtime.RuntimeError, "unsupported machine"):
+                 runtime.validate_dmi(dmi)
+diff --git a/udev/60-yogabook-gnss.rules b/udev/60-yogabook-gnss.rules
+index 469df2d..6f920d7 100644
+--- a/udev/60-yogabook-gnss.rules
++++ b/udev/60-yogabook-gnss.rules
+@@ -1,2 +1,4 @@
+-# Lenovo Yoga Book YB1-X91L: UART1 is dedicated to the BCM4752 GNSS receiver.
+-SUBSYSTEM=="tty", KERNEL=="ttyS5", KERNELS=="8086228A:01", ENV{ID_MM_DEVICE_IGNORE}="1", GROUP="dialout", MODE="0660"
++# Lenovo Yoga Book: the DesignWare UART on 8086228A:01 is dedicated to the
++# BCM4752 GNSS receiver. The YB1-X91L exposes it as ttyS5, the YB1-X90F as
++# ttyS2; matching the PCI function covers both.
++SUBSYSTEM=="tty", KERNELS=="8086228A:01", ENV{ID_MM_DEVICE_IGNORE}="1", GROUP="dialout", MODE="0660"

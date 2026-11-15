@@ -1,0 +1,401 @@
+From e7ae9333b95e0344c33affa570fd75ecfc2e6978 Mon Sep 17 00:00:00 2001
+From: Michal Bicz <2608098+mbicz@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:54:47 -0700
+Subject: [PATCH] power: advance ambient brightness independently of sensor
+ events
+
+Use a regular 50 ms timer for the existing low-pass filter. Sensor notifications update the target rather than applying the elapsed quiet interval to a new target. Continue to the target even when the sensor level stops changing.
+
+Keep manual changes immediate. Stop pending transitions on disable, idle, session deactivation, sensor loss and shutdown. Cover held readings, long quiet intervals and cancellation with the real power daemon on private D-Bus buses.
+
+Signed-off-by: Michal Bicz <2608098+mbicz@users.noreply.github.com>
+---
+ plugins/power/gsd-power-manager.c | 127 +++++++++++++++++++++---------
+ plugins/power/meson.build         |   1 +
+ plugins/power/test.py             |  98 +++++++++++++++++++++++
+ 3 files changed, 189 insertions(+), 37 deletions(-)
+
+diff --git a/plugins/power/gsd-power-manager.c b/plugins/power/gsd-power-manager.c
+index 8a58291..3e73abf 100644
+--- a/plugins/power/gsd-power-manager.c
++++ b/plugins/power/gsd-power-manager.c
+@@ -23,6 +23,7 @@
+ #include "config.h"
+ 
+ #include <stdlib.h>
++#include <math.h>
+ #include <string.h>
+ #include <glib/gi18n.h>
+ #include <gtk/gtk.h>
+@@ -92,6 +93,9 @@
+ /* Convert bandwidth to time constant.  Units of constant are microseconds. */
+ #define GSD_AMBIENT_TIME_CONSTANT       (G_USEC_PER_SEC * 1.0f / (2.0f * G_PI * GSD_AMBIENT_BANDWIDTH_HZ))
+ 
++/* Advance transitions independently of the sensor's notification cadence. */
++#define GSD_AMBIENT_INTERVAL_MS        50
++
+ static const gchar introspection_xml[] =
+ "<node>"
+ "  <interface name='org.gnome.SettingsDaemon.Power.Screen'>"
+@@ -186,7 +190,9 @@ struct _GsdPowerManager
+         gdouble                  ambient_norm_value;
+         gdouble                  ambient_percentage_old;
+         gdouble                  ambient_last_absolute;
+-        gint64                   ambient_last_time;
++        gdouble                  ambient_target;
++        guint                    ambient_timeout_id;
++        guint                    ambient_manual_pending;
+ 
+         /* Power Profiles */
+         GDBusProxy              *power_profiles_proxy;
+@@ -1203,6 +1209,12 @@ action_hibernate (GsdPowerManager *manager)
+ }
+ 
+ 
++static void
++ambient_stop (GsdPowerManager *manager)
++{
++        g_clear_handle_id (&manager->ambient_timeout_id, g_source_remove);
++}
++
+ static void
+ light_claimed_cb (GObject      *source_object,
+                   GAsyncResult *res,
+@@ -1244,6 +1256,9 @@ light_released_cb (GObject      *source_object,
+ static void
+ iio_proxy_claim_light (GsdPowerManager *manager, gboolean active)
+ {
++        if (!active)
++                ambient_stop (manager);
++
+         if (manager->iio_proxy == NULL)
+                 return;
+         if (!manager->backlight)
+@@ -1768,6 +1783,8 @@ idle_set_mode (GsdPowerManager *manager, GsdPowerIdleMode mode)
+         }
+ 
+         manager->current_idle_mode = mode;
++        if (mode != GSD_POWER_IDLE_MODE_NORMAL)
++                ambient_stop (manager);
+         g_debug ("Doing a state transition: %s", idle_mode_to_string (mode));
+ 
+         /* if we're moving to an idle mode, make sure
+@@ -2576,6 +2593,11 @@ engine_settings_key_changed_cb (GSettings *settings,
+                                 const gchar *key,
+                                 GsdPowerManager *manager)
+ {
++        if (g_str_equal (key, "ambient-enabled")) {
++                if (!g_settings_get_boolean (settings, key))
++                        ambient_stop (manager);
++                return;
++        }
+         if (g_str_has_prefix (key, "sleep-inactive") ||
+             g_str_equal (key, "idle-delay") ||
+             g_str_equal (key, "idle-dim")) {
+@@ -2829,28 +2851,73 @@ logind_proxy_signal_cb (GDBusProxy  *proxy,
+         }
+ }
+ 
++static gboolean
++ambient_transition_cb (gpointer user_data)
++{
++        GsdPowerManager *manager = user_data;
++        gdouble alpha;
++        gint pc;
++        gboolean settled;
++
++        if (!manager->backlight ||
++            !manager->iio_proxy ||
++            !manager->session_is_active ||
++            manager->current_idle_mode != GSD_POWER_IDLE_MODE_NORMAL ||
++            manager->ambient_norm_required ||
++            manager->ambient_manual_pending != 0 ||
++            !g_settings_get_boolean (manager->settings, "ambient-enabled")) {
++                manager->ambient_timeout_id = 0;
++                return G_SOURCE_REMOVE;
++        }
++
++        /* Do not apply a newly received target over an earlier quiet interval,
++         * or catch up in one jump after a delayed main-loop iteration. */
++        alpha = (GSD_AMBIENT_INTERVAL_MS * 1000.0) /
++                (GSD_AMBIENT_TIME_CONSTANT + GSD_AMBIENT_INTERVAL_MS * 1000.0);
++        manager->ambient_accumulator += alpha *
++                (manager->ambient_target - manager->ambient_accumulator);
++
++        /* The backlight API has whole-percent resolution. Finish at the
++         * target instead of approaching the last percentage forever. */
++        settled = fabs (manager->ambient_target - manager->ambient_accumulator) < 1.0;
++        if (settled)
++                manager->ambient_accumulator = manager->ambient_target;
++        pc = manager->ambient_accumulator;
++
++        if (pc != manager->ambient_percentage_old) {
++                g_debug ("Setting brightness from ambient %.1f%%",
++                         manager->ambient_accumulator);
++                gsd_backlight_set_brightness_async (manager->backlight, pc, NULL, NULL, NULL);
++                manager->ambient_percentage_old = pc;
++        }
++
++        if (settled) {
++                manager->ambient_timeout_id = 0;
++                return G_SOURCE_REMOVE;
++        }
++        return G_SOURCE_CONTINUE;
++}
++
+ static void
+ iio_proxy_changed (GsdPowerManager *manager)
+ {
+         GVariant *val_has = NULL;
+         GVariant *val_als = NULL;
+-        gdouble brightness;
+-        gdouble alpha;
+-        gint64 current_time;
+-        gint pc;
+ 
+-        /* no display hardware */
+-        if (!manager->backlight)
++        if (!manager->backlight ||
++            !manager->iio_proxy ||
++            manager->ambient_manual_pending != 0)
+                 return;
+ 
+-        /* disabled */
+         if (!g_settings_get_boolean (manager->settings, "ambient-enabled"))
+                 return;
+ 
+         /* get latest results, which do not have to be Lux */
+         val_has = g_dbus_proxy_get_cached_property (manager->iio_proxy, "HasAmbientLight");
+-        if (val_has == NULL || !g_variant_get_boolean (val_has))
++        if (val_has == NULL || !g_variant_get_boolean (val_has)) {
++                ambient_stop (manager);
+                 goto out;
++        }
+         val_als = g_dbus_proxy_get_cached_property (manager->iio_proxy, "LightLevel");
+         if (val_als == NULL || g_variant_get_double (val_als) == 0.0)
+                 goto out;
+@@ -2865,36 +2932,14 @@ iio_proxy_changed (GsdPowerManager *manager)
+                 ch_backlight_renormalize (manager);
+         }
+ 
+-        /* time-weighted constant for moving average */
+-        current_time = g_get_monotonic_time();
+-        if (manager->ambient_last_time)
+-                alpha = 1.0f / (1.0f + (GSD_AMBIENT_TIME_CONSTANT / (current_time - manager->ambient_last_time)));
+-        else
+-                alpha = 0.0f;
+-        manager->ambient_last_time = current_time;
+-
+-        /* calculate exponential weighted moving average */
+-        brightness = manager->ambient_last_absolute * 100.f / manager->ambient_norm_value;
+-        brightness = MIN (brightness, 100.f);
+-        brightness = MAX (brightness, 0.f);
+-
+-        manager->ambient_accumulator = (alpha * brightness) +
+-                (1.0 - alpha) * manager->ambient_accumulator;
+-
+-        /* no valid readings yet */
+         if (manager->ambient_accumulator < 0.f)
+                 goto out;
+ 
+-        /* set new value */
+-        g_debug ("Setting brightness from ambient %.1f%%",
+-                 manager->ambient_accumulator);
+-        pc = manager->ambient_accumulator;
+-
+-        if (manager->backlight)
+-                gsd_backlight_set_brightness_async (manager->backlight, pc, NULL, NULL, NULL);
+-
+-        /* Assume setting worked. */
+-        manager->ambient_percentage_old = pc;
++        manager->ambient_target = CLAMP (manager->ambient_last_absolute * 100.f /
++                                        manager->ambient_norm_value, 0.f, 100.f);
++        if (manager->ambient_timeout_id == 0)
++                manager->ambient_timeout_id =
++                        g_timeout_add (GSD_AMBIENT_INTERVAL_MS, ambient_transition_cb, manager);
+ out:
+         g_clear_pointer (&val_has, g_variant_unref);
+         g_clear_pointer (&val_als, g_variant_unref);
+@@ -2934,6 +2979,7 @@ iio_proxy_vanished_cb (GDBusConnection *connection,
+                        gpointer user_data)
+ {
+         GsdPowerManager *manager = GSD_POWER_MANAGER (user_data);
++        ambient_stop (manager);
+         g_clear_object (&manager->iio_proxy);
+ }
+ 
+@@ -3022,7 +3068,7 @@ gsd_power_manager_startup (GApplication *app)
+         manager->ambient_norm_value = -1.f;
+         manager->ambient_percentage_old = -1.f;
+         manager->ambient_last_absolute = -1.f;
+-        manager->ambient_last_time = 0;
++        manager->ambient_target = -1.f;
+ 
+         manager->backlight = gsd_backlight_new (NULL);
+ 
+@@ -3144,6 +3190,7 @@ gsd_power_manager_shutdown (GApplication *app)
+         GsdPowerManager *manager = GSD_POWER_MANAGER (app);
+ 
+         g_debug ("Stopping power manager");
++        ambient_stop (manager);
+ 
+         if (manager->inhibit_lid_switch_timer_id != 0) {
+                 g_source_remove (manager->inhibit_lid_switch_timer_id);
+@@ -3280,6 +3327,7 @@ backlight_brightness_step_cb (GObject *object,
+ 
+         manager = g_object_get_data (G_OBJECT (invocation), "gsd-power-manager");
+         brightness = gsd_backlight_set_brightness_finish (backlight, res, &error);
++        manager->ambient_manual_pending--;
+ 
+         /* ambient brightness no longer valid */
+         manager->ambient_percentage_old = brightness;
+@@ -3310,6 +3358,7 @@ backlight_brightness_set_cb (GObject *object,
+ 
+         /* Return the invocation. */
+         brightness = gsd_backlight_set_brightness_finish (backlight, res, NULL);
++        manager->ambient_manual_pending--;
+ 
+         if (brightness >= 0) {
+                 manager->ambient_percentage_old = brightness;
+@@ -3333,6 +3382,8 @@ handle_method_call_screen (GsdPowerManager *manager,
+         }
+ 
+         g_object_set_data_full (G_OBJECT (invocation), "gsd-power-manager", g_object_ref (manager), g_object_unref);
++        ambient_stop (manager);
++        manager->ambient_manual_pending++;
+ 
+         if (g_strcmp0 (method_name, "StepUp") == 0) {
+                 g_debug ("screen step up");
+@@ -3480,6 +3531,8 @@ handle_set_property_other (GsdPowerManager *manager,
+                  * But none of our DBus API users actually read the result. */
+                 g_variant_get (value, "i", &brightness_value);
+                 if (manager->backlight) {
++                        ambient_stop (manager);
++                        manager->ambient_manual_pending++;
+                         gsd_backlight_set_brightness_async (manager->backlight, brightness_value,
+                                                             NULL,
+                                                             backlight_brightness_set_cb, g_object_ref (manager));
+diff --git a/plugins/power/meson.build b/plugins/power/meson.build
+index d886971..0ebd5d5 100644
+--- a/plugins/power/meson.build
++++ b/plugins/power/meson.build
+@@ -148,6 +148,7 @@ tests = [
+   'BatteryLevels',
+   'Brightness',
+   'BrightnessStep',
++  'Ambient',
+ ]
+ 
+ foreach test : tests
+diff --git a/plugins/power/test.py b/plugins/power/test.py
+index c813624..a29d9c6 100755
+--- a/plugins/power/test.py
++++ b/plugins/power/test.py
+@@ -1011,6 +1011,104 @@ class PowerPluginTestBatteryLevels(PowerPluginBase):
+         self.obj_session_mgr.Uninhibit(dbus.UInt32(inhibit_id),
+                 dbus_interface='org.gnome.SessionManager')
+ 
++class PowerPluginTestAmbient(PowerPluginBase):
++    def start_logind(self):
++        super().start_logind()
++        self.logind_obj.AddObject(
++            '/org/freedesktop/login1/session/auto',
++            'org.freedesktop.login1.Session', dbus.Dictionary({}, signature='sv'),
++            [('SetBrightness', 'ssu', '', '')])
++        self.backlight_session = self.system_bus_con.get_object(
++            'org.freedesktop.login1', '/org/freedesktop/login1/session/auto')
++
++    def start_plugin(self, env):
++        self.settings_gsd_power['idle-dim'] = False
++        self.settings_gsd_power['ambient-enabled'] = True
++        Gio.Settings.sync()
++        self.sensor, self.sensor_obj = self.spawn_server_template(
++            'iio-sensors-proxy',
++            {'has_ambient_light': True, 'light_level': 100.0})
++        self.addCleanup(self.stop_process, self.sensor)
++        super().start_plugin(env)
++
++    def setUp(self):
++        super().setUp()
++        if self.skip_sysfs_backlight:
++            self.skipTest("sysfs backlight support required for test")
++
++        self.screen = dbus.Interface(self.session_bus_con.get_object(
++            'org.gnome.SettingsDaemon.Power', '/org/gnome/SettingsDaemon/Power'),
++            dbus.PROPERTIES_IFACE)
++        deadline = time.monotonic() + 10
++        while not self.sensor_obj.GetInternalProperty('AmbientLightOwners'):
++            self.assertLess(time.monotonic(), deadline, "ambient sensor was not claimed")
++            time.sleep(0.05)
++        # Allow the claim callback to normalize the first reading.
++        time.sleep(1)
++
++    def brightness(self):
++        # Observe every request to the backlight backend, including requests
++        # made between polls, without depending on helper-process latency.
++        calls = self.backlight_session.GetMethodCalls(
++            'SetBrightness', dbus_interface='org.freedesktop.DBus.Mock')
++        if calls:
++            return int(calls[-1][1][2]) - 1
++        return int(self.screen.Get('org.gnome.SettingsDaemon.Power.Screen', 'Brightness'))
++
++    def set_light(self, level):
++        self.sensor_obj.SetInternalProperty(
++            'net.hadess.SensorProxy', 'LightLevel', dbus.Double(level))
++
++    def wait_brightness(self, predicate):
++        deadline = time.monotonic() + 10
++        while True:
++            value = self.brightness()
++            if predicate(value):
++                return value
++            self.assertLess(time.monotonic(), deadline,
++                            "brightness did not reach the ambient target: %d" % value)
++            time.sleep(0.05)
++
++    def test_single_reading_converges_without_jumping(self):
++        initial = self.brightness()
++        previous_raw = 51
++        for level, target in [(20.0, int(initial * 0.2)), (400.0, 100)]:
++            # A long interval without sensor changes must not become a large
++            # first step when the next reading arrives.
++            time.sleep(2)
++            self.backlight_session.ClearCalls(dbus_interface='org.freedesktop.DBus.Mock')
++            self.set_light(level)
++            self.wait_brightness(lambda value: value == target)
++            calls = self.backlight_session.GetMethodCalls(
++                'SetBrightness', dbus_interface='org.freedesktop.DBus.Mock')
++            for _, args in calls:
++                raw = int(args[2])
++                self.assertLessEqual(abs(raw - previous_raw), 5,
++                                     "ambient transition jumped by more than 5%")
++                previous_raw = raw
++
++    def test_manual_change_and_disable_cancel_transition(self):
++        initial = self.brightness()
++        self.set_light(400.0)
++        self.wait_brightness(lambda value: value > initial)
++        self.screen.Set('org.gnome.SettingsDaemon.Power.Screen', 'Brightness', dbus.Int32(35))
++        self.wait_brightness(lambda value: value == 35)
++        time.sleep(1)
++        self.assertEqual(self.brightness(), 35, "ambient transition overrode manual brightness")
++
++        # The next reading establishes the new manual baseline.
++        self.set_light(300.0)
++        time.sleep(0.2)
++        self.set_light(30.0)
++        self.wait_brightness(lambda value: value < 35)
++        self.settings_gsd_power['ambient-enabled'] = False
++        Gio.Settings.sync()
++        time.sleep(0.2)
++        held = self.brightness()
++        time.sleep(1)
++        self.assertEqual(self.brightness(), held, "disabled ambient transition kept running")
++
++
+ class PowerPluginTestBrightness(PowerPluginBase):
+     def test_check_missing_kbd_brightness(self):
+         ''' https://bugzilla.gnome.org/show_bug.cgi?id=793512 '''
+-- 
+2.56.0
+

@@ -1,0 +1,205 @@
+diff --git a/drivers/power/supply/bq25890_charger.c b/drivers/power/supply/bq25890_charger.c
+index 305318b21..cafae938a 100644
+--- a/drivers/power/supply/bq25890_charger.c
++++ b/drivers/power/supply/bq25890_charger.c
+@@ -132,6 +132,11 @@ struct bq25890_device {
+ 	struct bq25890_state state;
+ 
+ 	struct mutex lock; /* protect state data */
++
++	/* End-of-charge threshold, in battery percentage. */
++	struct notifier_block battery_nb;
++	int charge_end_threshold;
++	bool charge_inhibited;
+ };
+ 
+ static DEFINE_IDR(bq25890_id);
+@@ -485,6 +490,102 @@ static void bq25890_update_state(struct bq25890_device *bq,
+ 			ret, !ret, 25000, 1000000);
+ }
+ 
++/*
++ * Gate charging on the battery gauge's reported capacity. The BQ25890 has no
++ * percentage-based end-of-charge comparator; F_CHG_CFG is the charge-enable
++ * bit, so the driver toggles it as the gauge crosses the configured threshold.
++ * Clearing F_CHG_CFG stops charge FET conduction without forcing the system
++ * onto battery (unlike F_EN_HIZ), so the machine keeps running from VBUS.
++ */
++struct bq25890_capacity_lookup {
++	int capacity;
++	bool found;
++};
++
++static int bq25890_find_battery_capacity(struct power_supply *psy, void *data)
++{
++	struct bq25890_capacity_lookup *lookup = data;
++	union power_supply_propval val;
++	int ret;
++
++	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
++		return 0;
++
++	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
++	if (ret < 0)
++		return 0;
++
++	lookup->capacity = val.intval;
++	lookup->found = true;
++
++	return 1; /* stop iterating: one battery is enough */
++}
++
++/*
++ * Re-evaluate the charge gate against the current battery capacity. Called
++ * from the gauge's change notification and whenever the limit is written.
++ */
++static void bq25890_apply_charge_limit(struct bq25890_device *bq)
++{
++	struct bq25890_capacity_lookup lookup = { };
++	bool inhibit, was_inhibited;
++	int ret, threshold;
++
++	power_supply_for_each_psy(&lookup, bq25890_find_battery_capacity);
++	if (!lookup.found)
++		return;
++
++	mutex_lock(&bq->lock);
++	threshold = bq->charge_end_threshold;
++	was_inhibited = bq->charge_inhibited;
++	mutex_unlock(&bq->lock);
++
++	/*
++	 * Resume charging with hysteresis, so it does not toggle per percent.
++	 * A limit of 100% means "no limit": the gauge cannot exceed it.
++	 */
++	if (threshold >= 100)
++		inhibit = false;
++	else if (was_inhibited)
++		inhibit = lookup.capacity > threshold;
++	else
++		inhibit = lookup.capacity >= threshold;
++
++	if (inhibit == was_inhibited)
++		return;
++
++	mutex_lock(&bq->lock);
++	ret = bq25890_field_write(bq, F_CHG_CFG, !inhibit);
++	if (ret < 0) {
++		mutex_unlock(&bq->lock);
++		dev_warn(bq->dev, "Failed to %s charging: %d\n",
++			 inhibit ? "suspend" : "resume", ret);
++		return;
++	}
++
++	bq->charge_inhibited = inhibit;
++	mutex_unlock(&bq->lock);
++
++	dev_info(bq->dev, "%s charging at %d%% (limit %d%%)\n",
++		 inhibit ? "Suspended" : "Resumed", lookup.capacity, threshold);
++}
++
++static int bq25890_battery_notifier(struct notifier_block *nb,
++				    unsigned long event, void *data)
++{
++	struct bq25890_device *bq = container_of(nb, struct bq25890_device, battery_nb);
++	struct power_supply *psy = data;
++
++	if (event != PSY_EVENT_PROP_CHANGED || psy == NULL)
++		return NOTIFY_OK;
++	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
++		return NOTIFY_OK;
++
++	bq25890_apply_charge_limit(bq);
++
++	return NOTIFY_OK;
++}
++
+ static int bq25890_power_supply_get_property(struct power_supply *psy,
+ 					     enum power_supply_property psp,
+ 					     union power_supply_propval *val)
+@@ -675,6 +776,10 @@ static int bq25890_power_supply_get_property(struct power_supply *psy,
+ 		val->intval = bq25890_find_val(ret, TBL_TSPCT);
+ 		break;
+ 
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		val->intval = bq->charge_end_threshold;
++		break;
++
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -709,6 +814,17 @@ static int bq25890_power_supply_set_property(struct power_supply *psy,
+ 			bq->force_hiz = !val->intval;
+ 		bq25890_update_state(bq, psp, &state);
+ 		return ret;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		if (val->intval < 0 || val->intval > 100)
++			return -EINVAL;
++
++		mutex_lock(&bq->lock);
++		bq->charge_end_threshold = val->intval;
++		mutex_unlock(&bq->lock);
++
++		/* Apply the new limit immediately. */
++		bq25890_apply_charge_limit(bq);
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -722,6 +838,7 @@ static int bq25890_power_supply_property_is_writeable(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
+ 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+ 	case POWER_SUPPLY_PROP_ONLINE:
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -1003,6 +1120,7 @@ static const enum power_supply_property bq25890_power_supply_props[] = {
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_CURRENT_NOW,
+ 	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+ };
+ 
+ static char *bq25890_charger_supplied_to[] = {
+@@ -1472,6 +1590,8 @@ static int bq25890_probe(struct i2c_client *client)
+ 	bq->client = client;
+ 	bq->dev = dev;
+ 	bq->id = -1;
++	/* Default to the hardware's own behaviour: charge to full. */
++	bq->charge_end_threshold = 100;
+ 
+ 	mutex_init(&bq->lock);
+ 	INIT_DELAYED_WORK(&bq->pump_express_work, bq25890_pump_express_work);
+@@ -1544,6 +1664,15 @@ static int bq25890_probe(struct i2c_client *client)
+ 		usb_register_notifier(bq->usb_phy, &bq->usb_nb);
+ 	}
+ 
++	/*
++	 * Charging is gated by the battery gauge's capacity, which may be
++	 * registered before or after this charger. Watch for its changes.
++	 */
++	bq->battery_nb.notifier_call = bq25890_battery_notifier;
++	ret = power_supply_reg_notifier(&bq->battery_nb);
++	if (ret)
++		return ret;
++
+ 	return 0;
+ }
+ 
+@@ -1551,6 +1680,15 @@ static void bq25890_remove(struct i2c_client *client)
+ {
+ 	struct bq25890_device *bq = i2c_get_clientdata(client);
+ 
++	power_supply_unreg_notifier(&bq->battery_nb);
++
++	/*
++	 * If charging was gated when the driver goes away, nothing else owns
++	 * F_CHG_CFG on boards with skip_reset, so restore charge enable.
++	 */
++	if (bq->charge_inhibited)
++		bq25890_field_write(bq, F_CHG_CFG, 1);
++
+ 	if (!IS_ERR_OR_NULL(bq->usb_phy)) {
+ 		usb_unregister_notifier(bq->usb_phy, &bq->usb_nb);
+ 		cancel_work_sync(&bq->usb_work);

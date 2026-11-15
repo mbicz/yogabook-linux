@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+"""Suspend on the Yoga Book's physical SW_LID switch; never read hinge angles.
+
+Install with yogabook-lid-watch.service, logind-yogabook-lid.conf and
+yogabook-sleep.conf (see docs/NOTES.md). Requires python3-evdev.
+"""
+import errno
+import fcntl
+from pathlib import Path
+import subprocess
+
+import evdev
+from evdev import ecodes
+
+EVIOCGSW_8 = 0x8008451B  # _IOC(_IOC_READ, 'E', 0x1b, 8), linux/input.h
+WAKEUP_COUNT = Path('/sys/power/wakeup_count')
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def find_lid():
+    for path in sorted(evdev.list_devices()):
+        parent = Path('/sys/class/input', Path(path).name, 'device').resolve()
+        # Newer kernels register gpio-keys outside the tablet driver's subtree.
+        # Match the physical GPIO input driver, not its platform-device parent.
+        if not any(
+            (node / 'driver').is_symlink()
+            and (node / 'driver').resolve().name == 'gpio-keys'
+            for node in parent.parents
+        ):
+            continue
+        device = evdev.InputDevice(path)
+        if ecodes.SW_LID in device.capabilities().get(ecodes.EV_SW, []):
+            return device
+        device.close()
+    raise RuntimeError('No gpio-keys SW_LID input device found')
+
+
+def is_closed(device):
+    switches = fcntl.ioctl(device.fd, EVIOCGSW_8, bytes(8))
+    return bool(switches[0] & (1 << ecodes.SW_LID))
+
+
+def suspend_on_close(device):
+    # Reading can block until the close event is fully processed. Recheck the
+    # switch afterward, then preserve any subsequent wake across logind's delay.
+    count = WAKEUP_COUNT.read_text()
+    if not is_closed(device):
+        log('CANCEL suspend: lid already open')
+        return
+    try:
+        WAKEUP_COUNT.write_text(count)
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        log('CANCEL suspend: concurrent wake event')
+        return
+    log('ACTION suspend: physical lid closed')
+    result = subprocess.run(['systemctl', 'suspend'], check=False)
+    if result.returncode:
+        log(f'ERROR suspend request failed: exit {result.returncode}')
+
+
+def main():
+    device = find_lid()
+    try:
+        closed = is_closed(device)
+        log(f'READY device={device.path} lid={"closed" if closed else "open"}')
+        if closed:
+            suspend_on_close(device)
+        for event in device.read_loop():
+            if event.type != ecodes.EV_SW or event.code != ecodes.SW_LID:
+                continue
+            current = bool(event.value)
+            if current == closed:
+                continue
+            closed = current
+            log('LID closed' if closed else 'LID open')
+            if closed:
+                suspend_on_close(device)
+    finally:
+        device.close()
+
+
+if __name__ == '__main__':
+    main()

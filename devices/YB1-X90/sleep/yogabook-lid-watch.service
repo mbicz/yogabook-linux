@@ -1,0 +1,14 @@
+[Unit]
+Description=Yoga Book X90F physical lid switch suspend
+After=systemd-logind.service
+# logind ignores lid actions; this service alone requests sleep on SW_LID.
+# Pair with yogabook-sleep.conf to preserve wake-event cancellation.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/yogabook-lid-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
